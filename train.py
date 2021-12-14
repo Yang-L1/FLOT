@@ -1,13 +1,14 @@
 import os
+import sys
+sys.path.append("flot/")
 import time
 import torch
 import argparse
 from tqdm import tqdm
 from datetime import datetime
-from flot.datasets.generic import Batch
 from flot.models.scene_flow import FLOT
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 
 
 def compute_epe(est_flow, batch):
@@ -91,7 +92,7 @@ def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epo
     # Log directory
     if not os.path.exists(path2log):
         os.makedirs(path2log)
-    writer = SummaryWriter(path2log)
+    # writer = SummaryWriter(path2log)
 
     # Reload state
     total_it = 0
@@ -112,24 +113,36 @@ def train(scene_flow, trainloader, delta, optimizer, scheduler, path2log, nb_epo
         for it, batch in enumerate(tqdm(trainloader)):
 
             # Send data to GPU
-            batch = batch.to(device, non_blocking=True)
+            src_pcd, tgt_pcd,  sflow = batch
+
+            src_pcd = src_pcd.to(device, non_blocking=True)
+            tgt_pcd = tgt_pcd.to(device, non_blocking=True)
+            sflow_gt = sflow.to(device, non_blocking=True)
 
             # Gradient step
             optimizer.zero_grad()
-            est_flow = scene_flow(batch["sequence"])
-            loss = compute_loss(est_flow, batch)
+            est_flow = scene_flow([ src_pcd, tgt_pcd])
+
+            error = est_flow - sflow_gt
+            loss = torch.mean(torch.abs(error))
+
             loss.backward()
             optimizer.step()
 
             # Loss evolution
             running_loss += loss.item()
-            running_epe += compute_epe(est_flow, batch).item()
+
+
+            error = est_flow - sflow_gt
+            epe_per_point = torch.sqrt(torch.sum(torch.pow(error, 2.0), -1))
+            epe = epe_per_point.mean()
+            running_epe += epe.item()
 
             # Logs
             if it % delta == delta - 1:
                 # Print / save logs
-                writer.add_scalar("Loss/epe", running_epe / delta, total_it)
-                writer.add_scalar("Loss/loss", running_loss / delta, total_it)
+                # writer.add_scalar("Loss/epe", running_epe / delta, total_it)
+                # writer.add_scalar("Loss/loss", running_loss / delta, total_it)
                 print(
                     "Epoch {0:d} - It. {1:d}: loss = {2:e}".format(
                         epoch, total_it, running_loss / delta
@@ -189,33 +202,47 @@ def my_main(dataset_name, nb_iter, batch_size, max_points, nb_epochs):
     pathroot = os.path.dirname(__file__)
 
     # Path to dataset
-    if dataset_name.lower() == "HPLFlowNet".lower():
-        path2data = os.path.join(
-            pathroot, "..", "data", "HPLFlowNet", "FlyingThings3D_subset_processed_35m"
-        )
-        from flot.datasets.flyingthings3d_hplflownet import FT3D
+    # if dataset_name.lower() == "HPLFlowNet".lower():
+    #     path2data = os.path.join(
+    #         pathroot, "..", "data", "HPLFlowNet", "FlyingThings3D_subset_processed_35m"
+    #     )
+    #     from flot.datasets.flyingthings3d_hplflownet import FT3D
+    #
+    #     lr_lambda = lambda epoch: 1.0 if epoch < 50 else 0.1
+    # elif dataset_name.lower() == "flownet3d".lower():
+    #     path2data = os.path.join(
+    #         pathroot, "..", "data", "flownet3d", "data_processed_maxcut_35_20k_2k_8192"
+    #     )
+    #     from flot.datasets.flyingthings3d_flownet3d import FT3D
+    #
+    #     lr_lambda = lambda epoch: 1.0 if epoch < 340 else 0.1
+    # else:
+    #     raise ValueError("Invalid dataset name: " + dataset_name)
 
-        lr_lambda = lambda epoch: 1.0 if epoch < 50 else 0.1
-    elif dataset_name.lower() == "flownet3d".lower():
-        path2data = os.path.join(
-            pathroot, "..", "data", "flownet3d", "data_processed_maxcut_35_20k_2k_8192"
-        )
-        from flot.datasets.flyingthings3d_flownet3d import FT3D
-
-        lr_lambda = lambda epoch: 1.0 if epoch < 340 else 0.1
-    else:
-        raise ValueError("Invalid dataset name: " + dataset_name)
+    lr_lambda = lambda epoch: 1.0 if epoch < 50 else 0.1
 
     # Training dataset
-    ft3d_train = FT3D(root_dir=path2data, nb_points=max_points, mode="train")
-    trainloader = DataLoader(
-        ft3d_train,
+    # ft3d_train = FT3D(root_dir=path2data, nb_points=max_points, mode="train")
+    # trainloader = DataLoader(
+    #     ft3d_train,
+    #     batch_size=batch_size,
+    #     pin_memory=True,
+    #     shuffle=True,
+    #     num_workers=6,
+    #     collate_fn=Batch,
+    #     drop_last=True,
+    # )
+
+
+    from datasets._4DMatch import _4DMatch
+    train_dataset = _4DMatch("train")
+    trainloader = torch.utils.data.DataLoader(
+        train_dataset,
         batch_size=batch_size,
-        pin_memory=True,
         shuffle=True,
         num_workers=6,
-        collate_fn=Batch,
-        drop_last=True,
+        pin_memory=True,
+        drop_last=True
     )
 
     # Model
@@ -231,7 +258,7 @@ def my_main(dataset_name, nb_iter, batch_size, max_points, nb_epochs):
     now = datetime.now().strftime("%y_%m_%d-%H_%M_%S_%f")
     now += "__Iter_" + str(scene_flow.nb_iter)
     now += "__Pts_" + str(max_points)
-    path2log = os.path.join(pathroot, "..", "experiments", "logs_" + dataset_name, now)
+    path2log = os.path.join(pathroot, "flot", "experiments", "logs_" + dataset_name, now)
 
     # Train
     print("Training started. Logs in " + path2log)
@@ -247,15 +274,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset",
         type=str,
-        default="HPLFlowNet",
+        default="4dmatch",
         help="Training dataset. Either HPLFlowNet or " + "flownet3d.",
     )
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size.")
-    parser.add_argument("--nb_epochs", type=int, default=40, help="Number of epochs.")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size.")
+    parser.add_argument("--nb_epochs", type=int, default=60, help="Number of epochs.")
     parser.add_argument(
         "--nb_points",
         type=int,
-        default=2048,
+        default=8192,
         help="Maximum number of points in point cloud.",
     )
     parser.add_argument(
